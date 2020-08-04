@@ -1,26 +1,59 @@
 use anyhow::Result;
 use lazy_static::lazy_static;
+use nix::unistd::{sysconf, SysconfVar::PAGE_SIZE};
 use regex::Regex;
 use std::{
     convert::TryInto,
     fs::File,
     io::{BufRead, BufReader},
-    ops::Range,
-    path::Path,
+    mem::size_of,
+    path::Path, sync::Arc, hash::Hash, 
 };
+use lasso::{ThreadedRodeo, MiniSpur};
+use crate::process::Process;
 
 lazy_static! {
     static ref MAP_RE: Regex = Regex::new(r"^(?P<from>[0-9a-f]+)-(?P<to>[0-9a-f]+)\s+(?P<permissions>....)\s+(?P<offset>[0-9a-f]+)\s+(?P<dev>..:..)\s+(?P<inode>[0-9]+)\s*(?:(?P<path>.+))?$").unwrap();
+    static ref INTERNER: Arc<ThreadedRodeo<MiniSpur>> = Arc::new(ThreadedRodeo::new());
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Ord, PartialOrd, Eq, Copy, Clone, Hash)]
+pub struct Range {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct Map {
-    pub address_range: Range<u64>,
-    pub permissions: String,
+    pub address_range: Range,
+    permissions: MiniSpur,
     pub offset: u64,
-    pub device: String,
+    device: MiniSpur,
     pub inode: u64,
-    pub path: Option<String>,
+    path: Option<MiniSpur>,
+}
+
+impl Hash for Map {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.address_range.start);
+        state.write_u64(self.address_range.end);
+    }
+}
+
+impl PartialOrd for Map {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.address_range
+            .start
+            .partial_cmp(&other.address_range.start)
+    }
+}
+
+impl Ord for Map {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.address_range
+            .start
+            .cmp(&other.address_range.start)
+    }
 }
 
 pub struct PageOffsets {
@@ -43,15 +76,21 @@ impl Iterator for PageOffsets {
 
 impl Map {
     pub fn page_offsets(&self) -> PageOffsets {
+        let u64_size = size_of::<u64>() as u64;
+        let page_size = sysconf(PAGE_SIZE).unwrap().unwrap() as u64;
         PageOffsets {
-            start: (self.address_range.start / 4096 * 8),
-            end: (self.address_range.end / 4096 * 8) - 8,
+            start: (self.address_range.start / page_size * u64_size),
+            end: (self.address_range.end / page_size * u64_size) - u64_size,
         }
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        self.path.map(|path| INTERNER.resolve(&path))
     }
 }
 
-pub fn read(pid: u64) -> Result<Vec<Map>> {
-    let path = Path::new("/proc").join(pid.to_string()).join("maps");
+pub fn read(process: &Process) -> Result<Vec<Map>> {
+    let path = Path::new("/proc").join(process.pid.to_string()).join("maps");
     let file = File::open(path)?;
     let read = BufReader::new(file);
 
@@ -75,18 +114,17 @@ impl TryInto<Map> for &str {
         };
 
         Ok(Map {
-            address_range: u64::from_str_radix(captures.name("from").unwrap().as_str(), 16)?
-                ..u64::from_str_radix(captures.name("to").unwrap().as_str(), 16)?,
-            permissions: captures.name("permissions").unwrap().as_str().to_owned(),
+            address_range: Range { start: u64::from_str_radix(captures.name("from").unwrap().as_str(), 16)?, end: u64::from_str_radix(captures.name("to").unwrap().as_str(), 16)? },
+            permissions: INTERNER.get_or_intern(captures.name("permissions").unwrap().as_str()),
             offset: u64::from_str_radix(captures.name("offset").unwrap().as_str(), 16)?,
-            device: captures.name("dev").unwrap().as_str().to_owned(),
+            device: INTERNER.get_or_intern(captures.name("dev").unwrap().as_str()),
             inode: captures
                 .name("inode")
                 .unwrap()
                 .as_str()
                 .to_owned()
                 .parse()?,
-            path: captures.name("path").map(|p| p.as_str().to_owned()),
+            path: captures.name("path").map(|p| INTERNER.get_or_intern(p.as_str())),
         })
     }
 }
@@ -104,12 +142,12 @@ mod tests {
         assert_eq!(
             map,
             Map {
-                address_range: 2097152..2248704,
-                permissions: "r--p".to_owned(),
+                address_range: Range { start: 2097152, end: 2248704 },
+                permissions: INTERNER.get_or_intern("r--p"),
                 offset: 0,
-                device: "00:12".to_owned(),
+                device: INTERNER.get_or_intern("00:12"),
                 inode: 281474977421407,
-                path: Some("/init".to_owned()),
+                path: Some(INTERNER.get_or_intern("/init")),
             }
         );
 
@@ -119,10 +157,10 @@ mod tests {
     #[test]
     fn test_page_offsets() {
         let offsets: Vec<u64> = Map {
-            address_range: 0..0x2000,
-            permissions: "".to_owned(),
+            address_range: Range { start: 0, end: 0x2000 },
+            permissions: INTERNER.get_or_intern(""),
             offset: 0,
-            device: "00:00".to_owned(),
+            device: INTERNER.get_or_intern("00:00"),
             inode: 0,
             path: None,
         }

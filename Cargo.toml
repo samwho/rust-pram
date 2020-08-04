@@ -14,6 +14,12 @@ regex = "1"
 lazy_static = "1"
 hex = "0.4"
 bitfield = "0.13"
+nix = "0.18"
+maplit = "1"
+rayon = "1"
+once_cell = "1"
+string-interner = "0.12"
+lasso = { version = "0.3", features = ["multi-threaded"] }
 
 [dev-dependencies]
 pretty_assertions = "0.6"
